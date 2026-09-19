@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "bun:test";
 import { compileDeterministic, renderSections } from "../src/compilers/deterministic.ts";
 import { EventLog } from "../src/log.ts";
 import { resetFixtures, SessionBuilder } from "./fixtures.ts";

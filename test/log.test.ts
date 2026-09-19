@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "bun:test";
 import { EventLog } from "../src/log.ts";
 import { resetFixtures, SessionBuilder } from "./fixtures.ts";
 

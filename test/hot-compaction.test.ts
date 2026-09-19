@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "bun:test";
 import { HybridCompiler } from "../src/compilers/hybrid.ts";
 import { SEMANTIC_SECTIONS } from "../src/compilers/semantic.ts";
 import { HotCompactionManager, type PersistedGeneration } from "../src/hot-compaction.ts";

@@ -62,6 +62,19 @@ The `context_recall` tool searches the raw log, so the model can recover anythin
 
 `/hot-compact` with `status` (default), `now` (start a job), `emergency` (deterministic swap now), `retry` (reset the failure counter), `on`, `off`.
 
+## Status line and pi-footer
+
+The extension publishes `ctx.ui.setStatus("hot-compact", …)` for pi's own footer and, for [pi-footer](https://github.com/wobondar/pi-footer), the following `Pi Event Value` widget ids via `pi.events`:
+
+| widget id | value |
+|-----------|-------|
+| `hot_compact` | `● #812+ compacting…` (verbatim boundary plus job state; `◌ Off` when disabled). Trim 2 in pi-footer to drop the symbol. |
+| `hot_compact_gen` | `hot #812+`, `emergency #…`, `native #…`, `restored #…`, or `raw` |
+| `hot_compact_job` | `compacting…`, `ready`, `failed`, or cleared |
+| `hot_compact_checkpoint` | checkpoint size, e.g. `4.2k` |
+
+Values are re-emitted on session start, on every state change, and after a reload. Add a `Pi Extension Status` widget with key `hot-compact`, or a `Pi Event Value` widget with one of the ids above.
+
 ## Configuration
 
 `~/.pi/agent/hot-compact.json`, overridden by `<project>/.pi/hot-compact.json`. `PI_HOT_COMPACT_CONFIG` points at an alternative global file.
@@ -108,9 +121,9 @@ interface ContextCompiler {
 ## Development
 
 ```
-npm install
-npm test          # node:test, no build step
-npm run typecheck
+bun install
+bun test
+bun run typecheck
 ```
 
 ## Invariants

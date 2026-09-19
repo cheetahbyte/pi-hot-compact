@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "bun:test";
 import { EventLog } from "../src/log.ts";
 import { alignMessages, CHECKPOINT_CUSTOM_TYPE, reconcileDelta } from "../src/projection.ts";
 import type { CompiledContext } from "../src/types.ts";

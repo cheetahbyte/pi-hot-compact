@@ -145,6 +145,8 @@ export interface CompactionJob {
   startedAt: number;
   finishedAt?: number;
   error?: string;
+  /** Failed only because there was nothing to compact; not an error condition. */
+  noop?: boolean;
   compiled?: CompiledContext;
 }
 

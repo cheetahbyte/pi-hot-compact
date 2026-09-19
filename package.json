@@ -12,14 +12,15 @@
     "context"
   ],
   "scripts": {
-    "test": "node --test \"test/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit"
+    "test": "bun test",
+    "typecheck": "bun x tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.85.0 <1.0.0",
     "typebox": ">=1.0.0 <2.0.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.2.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
   },

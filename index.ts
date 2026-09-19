@@ -13,6 +13,15 @@ import { recall, type RecallMode } from "./src/recall.ts";
 import type { CompiledContext, EntryLike, Msg } from "./src/types.ts";
 
 const GENERATION_ENTRY = "hot-compact:generation";
+const STATUS_KEY = "hot-compact";
+// pi-footer "Pi Event Value" widget ids (https://github.com/wobondar/pi-footer#extension-integration)
+const FOOTER_EVENT = "pi-footer:update-widget";
+const FOOTER_WIDGETS = {
+  state: "hot_compact",
+  generation: "hot_compact_gen",
+  job: "hot_compact_job",
+  checkpoint: "hot_compact_checkpoint",
+} as const;
 const LOG_PATH = join(homedir(), ".pi", "agent", "hot-compact.log");
 const RECALL_MODES: RecallMode[] = ["keyword", "regex", "event", "tool", "file", "range"];
 
@@ -21,6 +30,7 @@ export default function (pi: ExtensionAPI) {
   let compiler = new HybridCompiler();
   let manager = new HotCompactionManager(compiler);
   let pendingNative: CompiledContext | null = null;
+  let lastUi: ExtensionContext["ui"] | null = null;
 
   const log = (line: string) => {
     if (!settings.debug) return;
@@ -53,6 +63,7 @@ export default function (pi: ExtensionAPI) {
       },
       {
         log,
+        onChange: publish,
         persist: (gen) => {
           try {
             pi.appendEntry(GENERATION_ENTRY, gen);
@@ -65,18 +76,39 @@ export default function (pi: ExtensionAPI) {
     manager.enabled = settings.enabled;
   };
 
-  const status = (ctx: ExtensionContext) => {
-    if (!ctx.hasUI) return;
-    if (!settings.enabled) {
-      ctx.ui.setStatus("hot-compact", undefined);
-      return;
+  const footer = (widgetId: string, value: string | null) => {
+    try {
+      pi.events.emit(FOOTER_EVENT, { widgetId, value });
+    } catch {
+      /* no event bus */
     }
+  };
+
+  /** Publish state to pi's status line (ctx.ui.setStatus) and to pi-footer event widgets. */
+  const publish = () => {
     const gen = manager.active;
     const job = manager.currentJob;
-    const parts = [`hc:${gen ? `#${gen.compiled.firstKeptSeq}+` : "raw"}`];
-    if (job?.status === "running") parts.push("compacting…");
-    else if (job?.status === "ready") parts.push("ready");
-    ctx.ui.setStatus("hot-compact", parts.join(" "));
+    if (!settings.enabled) {
+      lastUi?.setStatus(STATUS_KEY, undefined);
+      footer(FOOTER_WIDGETS.state, "◌ Off");
+      footer(FOOTER_WIDGETS.generation, null);
+      footer(FOOTER_WIDGETS.job, null);
+      footer(FOOTER_WIDGETS.checkpoint, null);
+      return;
+    }
+    const jobText = job?.status === "running" ? "compacting…" : job?.status === "ready" ? "ready" : job?.status === "failed" && !job.noop ? "failed" : "";
+    const genText = gen ? `#${gen.compiled.firstKeptSeq}+` : "raw";
+    const state = `● ${genText}${jobText ? ` ${jobText}` : ""}`;
+    lastUi?.setStatus(STATUS_KEY, state);
+    footer(FOOTER_WIDGETS.state, state);
+    footer(FOOTER_WIDGETS.generation, gen ? `${gen.source} ${genText}` : "raw");
+    footer(FOOTER_WIDGETS.job, jobText || null);
+    footer(FOOTER_WIDGETS.checkpoint, gen ? `${Math.round(gen.compiled.estimatedTokens / 100) / 10}k` : null);
+  };
+
+  const status = (ctx: ExtensionContext) => {
+    if (ctx.hasUI) lastUi = ctx.ui;
+    publish();
   };
 
   const makeComplete = (ctx: ExtensionContext): CompleteFn | undefined => {

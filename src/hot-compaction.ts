@@ -39,6 +39,8 @@ export interface PersistedGeneration {
 export interface ManagerHooks {
   persist?: (gen: PersistedGeneration) => void;
   log?: (line: string) => void;
+  /** Called after any job or generation state change. */
+  onChange?: () => void;
   now?: () => number;
   newId?: () => string;
 }
@@ -100,6 +102,13 @@ export class HotCompactionManager {
   }
   private debug(line: string): void {
     this.hooks.log?.(line);
+  }
+  private changed(): void {
+    try {
+      this.hooks.onChange?.();
+    } catch {
+      /* observers must not break compaction */
+    }
   }
 
   /** Sync with the current branch. A diverged branch invalidates the generation and any job. */
@@ -167,6 +176,7 @@ export class HotCompactionManager {
       source: "native",
     };
     this.lastFinishedAt = this.now();
+    this.changed();
     return this.activeGen;
   }
 
@@ -216,6 +226,7 @@ export class HotCompactionManager {
     const signal = this.abort.signal;
     const timer = setTimeout(() => this.abort?.abort(new Error("timeout")), this.config.jobTimeoutMs);
     this.debug(`job ${job.id} started (through #${job.snapshotThroughSeq}, base ${job.baseGeneration ?? "none"}, ${mode})`);
+    this.changed();
     this.compiler
       .compile(snapshot, { signal, deterministicOnly: mode === "emergency" })
       .then((compiled) => {
@@ -224,6 +235,7 @@ export class HotCompactionManager {
         job.status = "ready";
         job.finishedAt = this.now();
         this.debug(`job ${job.id} ready (kept from #${compiled.firstKeptSeq}, ~${compiled.estimatedTokens} tokens)`);
+        this.changed();
       })
       .catch((err: unknown) => {
         if (this.job !== job) return;
@@ -231,8 +243,10 @@ export class HotCompactionManager {
         job.finishedAt = this.now();
         job.error = err instanceof Error ? err.message : String(err);
         this.lastFinishedAt = this.now();
-        if (!(err instanceof NothingToCompactError)) this.failures++;
+        if (err instanceof NothingToCompactError) job.noop = true;
+        else this.failures++;
         this.debug(`job ${job.id} failed: ${job.error}`);
+        this.changed();
       })
       .finally(() => clearTimeout(timer));
     return job;
@@ -338,6 +352,7 @@ export class HotCompactionManager {
       this.job = null;
       this.abort = null;
     }
+    this.changed();
   }
 
   cancelJob(reason: string): void {
