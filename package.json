@@ -1,0 +1,31 @@
+{
+  "name": "pi-hot-compact",
+  "version": "0.1.0",
+  "description": "Hot compaction and context compiler for the pi coding agent: background compaction over an immutable event log, atomic context swap, recall of omitted history",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "compaction",
+    "context"
+  ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.85.0 <1.0.0",
+    "typebox": ">=1.0.0 <2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
