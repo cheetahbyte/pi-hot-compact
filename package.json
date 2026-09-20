@@ -5,6 +5,19 @@
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
+  "files": ["index.ts", "src/"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cheetahbyte/pi-hot-compact.git"
+  },
+  "homepage": "https://github.com/cheetahbyte/pi-hot-compact#readme",
+  "bugs": {
+    "url": "https://github.com/cheetahbyte/pi-hot-compact/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -13,7 +26,8 @@
   ],
   "scripts": {
     "test": "bun test",
-    "typecheck": "bun x tsc --noEmit"
+    "typecheck": "bun x tsc --noEmit",
+    "prepublishOnly": "bun test && bun run typecheck"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.86.0 <1.0.0",

@@ -18,11 +18,17 @@ Model-visible context = [checkpoint] + verbatim events from the boundary on
 
 ## Install
 
-```
-pi install git:github.com/<you>/pi-hot-compact
+```bash
+pi install npm:pi-hot-compact
 ```
 
-or, for a local checkout:
+Or install from GitHub:
+
+```bash
+pi install git:github.com/cheetahbyte/pi-hot-compact
+```
+
+For a local checkout:
 
 ```
 pi -e /path/to/pi-hot-compact/index.ts
@@ -125,6 +131,38 @@ bun install
 bun test
 bun run typecheck
 ```
+
+## Publish to npm
+
+You need Bun installed to run the publishing checks and an npm account with permission to publish `pi-hot-compact`.
+
+1. For subsequent releases, update `version` in `package.json`. Each published version must be unique.
+2. Inspect the package contents:
+
+   ```bash
+   npm pack --dry-run
+   ```
+
+   The package includes `index.ts`, `src/`, `package.json`, `README.md`, and `LICENSE`. Pi loads the TypeScript directly; no build step is required.
+3. Sign in to npm:
+
+   ```bash
+   npm login
+   ```
+
+4. Publish the package:
+
+   ```bash
+   npm publish
+   ```
+
+   The `prepublishOnly` script runs tests and type checking before publishing. Publishing stops if either check fails. Complete any authentication or two-factor verification npm requests.
+
+The `pi-package` keyword makes the published package discoverable by the [pi package gallery](https://pi.dev/packages). No image or video is required.
+
+## Acknowledgments
+
+Inspired by [pi-vcc](https://github.com/sting8k/pi-vcc) by [sting8k](https://github.com/sting8k).
 
 ## Invariants
 
