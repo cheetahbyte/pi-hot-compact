@@ -1,6 +1,6 @@
 {
   "name": "pi-hot-compact",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hot compaction and context compiler for the pi coding agent: background compaction over an immutable event log, atomic context swap, recall of omitted history",
   "license": "MIT",
   "type": "module",
