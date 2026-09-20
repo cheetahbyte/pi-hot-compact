@@ -28,7 +28,7 @@ or, for a local checkout:
 pi -e /path/to/pi-hot-compact/index.ts
 ```
 
-Requires pi 0.85 or newer. If `@sting8k/pi-vcc` or another extension also answers `session_before_compact`, set `handleNativeCompaction` to `false` here or uninstall the other one; pi takes the first non-empty answer.
+Requires pi 0.86 or newer (before 1.0). If `@sting8k/pi-vcc` or another extension also answers `session_before_compact`, set `handleNativeCompaction` to `false` here or uninstall the other one; pi takes the first non-empty answer.
 
 ## How it works
 
