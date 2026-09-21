@@ -1,14 +1,11 @@
 import { findTailCut, snapToCutPoint } from "../tail.ts";
 import { tokensForText } from "../tokens.ts";
-import { reconcileDelta } from "../projection.ts";
 import type {
   CompiledContext,
   CompileOptions,
-  Context,
   ContextCompiler,
   ContextSnapshot,
   DeterministicSections,
-  ReconcileOptions,
   SessionEvent,
   SnapshotInput,
 } from "../types.ts";
@@ -23,12 +20,9 @@ export interface HybridOptions {
   complete?: CompleteFn;
   /** Upper bound for the rendered checkpoint. Semantic text is dropped first, then the brief transcript shrinks. */
   maxCheckpointTokens: number;
-  reconcile: ReconcileOptions;
   now?: () => number;
   newId?: () => string;
 }
-
-export const DEFAULT_RECONCILE: ReconcileOptions = { collapseToolOutputChars: 4000, collapseKeepRecentTurns: 2 };
 
 let counter = 0;
 const defaultId = () => `${Date.now().toString(36)}-${(counter++).toString(36)}`;
@@ -46,7 +40,6 @@ export class HybridCompiler implements ContextCompiler {
       deterministic: {},
       semantic: {},
       maxCheckpointTokens: 12_000,
-      reconcile: DEFAULT_RECONCILE,
       ...options,
     };
   }
@@ -104,7 +97,7 @@ export class HybridCompiler implements ContextCompiler {
       const base = snapshot.base?.compiled;
       const spanStart = base ? base.firstKeptSeq : 0;
       const span = region.filter((e) => e.seq >= spanStart);
-      const previous = base?.semantic ?? (base?.native ? base.checkpoint : undefined);
+      const previous = base?.semantic ?? (base?.foreign ? base.checkpoint : undefined);
       semantic = await compileSemantic(span, previous, this.opts.complete, this.opts.semantic, options.signal);
     }
     return this.assemble(snapshot, sections, semantic, firstKeptSeq, firstKeptEntryId);
@@ -135,10 +128,6 @@ export class HybridCompiler implements ContextCompiler {
       estimatedTokens: tokensForText(text),
       compiler: this.name,
     };
-  }
-
-  reconcile(compiled: CompiledContext, delta: SessionEvent[], options: Partial<ReconcileOptions> = {}, generationId = ""): Context {
-    return reconcileDelta(compiled, delta, { ...this.opts.reconcile, ...options }, generationId);
   }
 }
 

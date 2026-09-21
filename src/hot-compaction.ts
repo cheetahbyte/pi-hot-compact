@@ -1,6 +1,6 @@
 import { EventLog } from "./log.ts";
-import { estimateMessagesTokens } from "./tokens.ts";
-import type { CompactionJob, CompiledContext, ContextCompiler, ContextGeneration, EntryLike } from "./types.ts";
+import { estimateMessagesTokens, tokensForText } from "./tokens.ts";
+import type { CompactionJob, CompiledContext, ContextCompiler, ContextGeneration, DeterministicSections, EntryLike, HotCompactDetails } from "./types.ts";
 import { NothingToCompactError } from "./types.ts";
 
 export interface HotCompactionConfig {
@@ -26,18 +26,7 @@ export const DEFAULT_HOT_CONFIG: HotCompactionConfig = {
   maxRetries: 3,
 };
 
-export interface PersistedGeneration {
-  id: string;
-  baseGenerationId: string | null;
-  firstKeptEntryId: string;
-  throughEntryId: string;
-  compiled: Omit<CompiledContext, "firstKeptSeq" | "throughSeq">;
-  createdAt: number;
-  source: ContextGeneration["source"];
-}
-
 export interface ManagerHooks {
-  persist?: (gen: PersistedGeneration) => void;
   log?: (line: string) => void;
   /** Called after any job or generation state change. */
   onChange?: () => void;
@@ -51,17 +40,78 @@ export interface UsageSample {
   contextWindow: number;
 }
 
+/** A compiled result the caller commits as a compaction entry at the next boundary. */
+export interface ReadyResult {
+  jobId: string;
+  mode: "hot" | "emergency";
+  compiled: CompiledContext;
+}
+
 let idCounter = 0;
 const defaultId = () => `g${Date.now().toString(36)}${(idCounter++).toString(36)}`;
 
+const EMPTY_SECTIONS: DeterministicSections = { sessionGoal: [], filesAndChanges: [], commits: [], outstandingContext: [], userPreferences: [], briefTranscript: [], omittedTurns: 0 };
+
+export function isHotCompactDetails(d: unknown): d is HotCompactDetails {
+  if (typeof d !== "object" || d === null) return false;
+  const o = d as { hotCompact?: unknown; sections?: { briefTranscript?: unknown }; throughEntryId?: unknown };
+  return o.hotCompact === true && Array.isArray(o.sections?.briefTranscript) && typeof o.throughEntryId === "string";
+}
+
+/** Details this extension stores on every compaction entry it produces. */
+export function compactionDetails(compiled: CompiledContext, source: HotCompactDetails["source"]): HotCompactDetails {
+  return { hotCompact: true, source, compiler: compiled.compiler, sections: compiled.sections, semantic: compiled.semantic, throughEntryId: compiled.throughEntryId };
+}
+
 /**
- * Owns the event log, the active context generation and the background job.
+ * Read the active generation back from the latest compaction entry on the branch.
+ * pi owns persistence, restore, fork and tree handling; nothing is stored elsewhere.
+ */
+export function generationFromLog(log: EventLog): ContextGeneration | null {
+  const events = log.all();
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (ev.type !== "compaction") continue;
+    const entry = ev.entry;
+    const keptId = entry.firstKeptEntryId ?? "";
+    const firstKeptSeq = keptId === ev.id ? ev.seq : log.seqOf(keptId);
+    if (firstKeptSeq === undefined) return null;
+    const summary = entry.summary ?? "";
+    const d = entry.details;
+    const ours = isHotCompactDetails(d);
+    const throughEntryId = ours ? d.throughEntryId : ev.id;
+    const throughSeq = log.seqOf(throughEntryId) ?? ev.seq;
+    return {
+      id: ev.id,
+      epoch: log.epoch,
+      createdAt: ev.timestamp,
+      source: ours ? d.source : "foreign",
+      compiled: {
+        checkpoint: summary,
+        firstKeptSeq,
+        firstKeptEntryId: keptId,
+        throughSeq,
+        throughEntryId,
+        sections: ours ? d.sections : EMPTY_SECTIONS,
+        semantic: ours ? d.semantic : undefined,
+        estimatedTokens: tokensForText(summary),
+        compiler: ours ? d.compiler : "foreign",
+        foreign: !ours,
+      },
+    };
+  }
+  return null;
+}
+
+/**
+ * Owns the event log and the background job. The active generation is derived
+ * from the branch on every sync.
  *
  * Invariants enforced here:
  *  - the log is append-only per epoch; a branch change bumps the epoch
  *  - a job records its snapshot boundary and base generation
- *  - only trySwap() changes the active generation, and only when the job is
- *    still consistent with the log and the active generation
+ *  - takeReady() hands a result out only when the job is still consistent with
+ *    the log and the active generation; stale results are discarded
  *  - failures never throw out of the manager; they are recorded and retried later
  */
 export class HotCompactionManager {
@@ -111,14 +161,22 @@ export class HotCompactionManager {
     }
   }
 
-  /** Sync with the current branch. A diverged branch invalidates the generation and any job. */
+  /** Sync with the current branch and re-derive the active generation from it. */
   syncBranch(entries: EntryLike[]): void {
     const diverged = this.log.sync(entries);
     if (diverged) {
       this.debug(`branch diverged; epoch ${this.log.epoch}`);
-      this.activeGen = null;
       this.cancelJob("branch changed");
     }
+    const gen = generationFromLog(this.log);
+    if (gen?.id === this.activeGen?.id && gen?.epoch === this.activeGen?.epoch) return;
+    this.activeGen = gen;
+    if (gen) {
+      this.lastFinishedAt = this.now();
+      if (this.job && this.job.baseGeneration !== gen.id) this.cancelJob("generation changed");
+    }
+    this.debug(gen ? `active generation ${gen.id} (${gen.source}, kept from #${gen.compiled.firstKeptSeq})` : "no active generation");
+    this.changed();
   }
 
   reset(): void {
@@ -128,56 +186,6 @@ export class HotCompactionManager {
     this.failures = 0;
     this.lastFinishedAt = 0;
     this.history = [];
-  }
-
-  /** Restore the newest persisted generation whose boundaries still exist on the branch. */
-  restore(persisted: PersistedGeneration[]): ContextGeneration | null {
-    for (let i = persisted.length - 1; i >= 0; i--) {
-      const p = persisted[i];
-      const firstKeptSeq = this.log.seqOf(p.firstKeptEntryId);
-      const throughSeq = this.log.seqOf(p.throughEntryId);
-      if (firstKeptSeq === undefined || throughSeq === undefined) continue;
-      this.activeGen = {
-        id: p.id,
-        epoch: this.log.epoch,
-        baseGenerationId: p.baseGenerationId,
-        compiled: { ...p.compiled, firstKeptSeq, throughSeq },
-        createdAt: p.createdAt,
-        source: "restored",
-      };
-      this.debug(`restored generation ${p.id} (kept from #${firstKeptSeq})`);
-      return this.activeGen;
-    }
-    return null;
-  }
-
-  /** Adopt a compaction entry pi wrote (native path). pi injects its summary itself. */
-  adoptNative(entry: { id: string; summary: string; firstKeptEntryId: string }, compiled?: CompiledContext): ContextGeneration | null {
-    const firstKeptSeq = this.log.seqOf(entry.firstKeptEntryId);
-    const throughSeq = this.log.seqOf(entry.id);
-    if (firstKeptSeq === undefined || throughSeq === undefined) return null;
-    const base = compiled ?? {
-      checkpoint: entry.summary,
-      sections: { sessionGoal: [], filesAndChanges: [], commits: [], outstandingContext: [], userPreferences: [], briefTranscript: [], omittedTurns: 0 },
-      estimatedTokens: Math.ceil(entry.summary.length / 4),
-      compiler: "native",
-      firstKeptEntryId: entry.firstKeptEntryId,
-      throughEntryId: entry.id,
-      firstKeptSeq,
-      throughSeq,
-    };
-    this.cancelJob("native compaction");
-    this.activeGen = {
-      id: (this.hooks.newId ?? defaultId)(),
-      epoch: this.log.epoch,
-      baseGenerationId: this.activeGen?.id ?? null,
-      compiled: { ...base, firstKeptSeq, throughSeq, native: true, firstKeptEntryId: entry.firstKeptEntryId, throughEntryId: entry.id },
-      createdAt: this.now(),
-      source: "native",
-    };
-    this.lastFinishedAt = this.now();
-    this.changed();
-    return this.activeGen;
   }
 
   /** Estimated tokens of events newer than the active generation's snapshot. */
@@ -252,8 +260,8 @@ export class HotCompactionManager {
     return job;
   }
 
-  /** Deterministic compile and swap right now (no LLM). Used above the hard threshold. */
-  emergency(): ContextGeneration | null {
+  /** Deterministic compile right now (no LLM) for the hard threshold. The caller commits the result. */
+  emergency(): ReadyResult | null {
     this.cancelJob("emergency");
     try {
       const snapshot = this.compiler.snapshot({ events: this.log.all(), epoch: this.log.epoch, base: this.activeGen, tailTokens: this.config.tailTokens });
@@ -264,16 +272,19 @@ export class HotCompactionManager {
         snapshotThroughSeq: snapshot.throughSeq,
         snapshotThroughEntryId: snapshot.throughEntryId,
         baseGeneration: this.activeGen?.id ?? null,
-        status: "ready",
+        status: "applied",
         mode: "emergency",
         startedAt: this.now(),
         finishedAt: this.now(),
         compiled,
       };
-      this.job = job;
-      return this.trySwap();
+      this.history.push(job);
+      if (this.history.length > 20) this.history.shift();
+      this.lastFinishedAt = this.now();
+      this.changed();
+      return { jobId: job.id, mode: "emergency", compiled };
     } catch (err) {
-      this.debug(`emergency compile failed: ${String(err)}`);
+      if (!(err instanceof NothingToCompactError)) this.debug(`emergency compile failed: ${String(err)}`);
       return null;
     }
   }
@@ -292,10 +303,10 @@ export class HotCompactionManager {
   }
 
   /**
-   * Apply a ready job if it is still consistent with the log. Called at a safe
-   * boundary (before an LLM call). Stale results are discarded, never applied.
+   * Hand out a ready job's result for the caller to commit as a compaction entry,
+   * if the job is still consistent with the log. Stale results are discarded, never applied.
    */
-  trySwap(): ContextGeneration | null {
+  takeReady(): ReadyResult | null {
     const job = this.job;
     if (!job || job.status !== "ready" || !job.compiled) return null;
     const reason = this.staleReason(job);
@@ -306,30 +317,11 @@ export class HotCompactionManager {
       this.debug(`job ${job.id} stale: ${reason}`);
       return null;
     }
-    const gen: ContextGeneration = {
-      id: (this.hooks.newId ?? defaultId)(),
-      epoch: job.epoch,
-      baseGenerationId: job.baseGeneration,
-      compiled: job.compiled,
-      createdAt: this.now(),
-      source: job.mode === "emergency" ? "emergency" : "hot",
-    };
-    this.activeGen = gen;
     job.status = "applied";
     this.failures = 0;
     this.finishJob(job);
-    const { firstKeptSeq: _f, throughSeq: _t, ...rest } = gen.compiled;
-    this.hooks.persist?.({
-      id: gen.id,
-      baseGenerationId: gen.baseGenerationId,
-      firstKeptEntryId: gen.compiled.firstKeptEntryId,
-      throughEntryId: gen.compiled.throughEntryId,
-      compiled: rest,
-      createdAt: gen.createdAt,
-      source: gen.source,
-    });
-    this.debug(`generation ${gen.id} active (kept from #${gen.compiled.firstKeptSeq}, through #${gen.compiled.throughSeq})`);
-    return gen;
+    this.debug(`job ${job.id} handed out (kept from #${job.compiled.firstKeptSeq}, through #${job.compiled.throughSeq})`);
+    return { jobId: job.id, mode: job.mode, compiled: job.compiled };
   }
 
   private staleReason(job: CompactionJob): string | null {

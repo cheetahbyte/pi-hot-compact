@@ -1,4 +1,4 @@
-import type { EntryLike, Msg } from "../src/types.ts";
+import type { ContentBlock, EntryLike, Msg } from "../src/types.ts";
 
 let ts = Date.parse("2026-09-19T10:00:00Z");
 let n = 0;
@@ -49,9 +49,17 @@ export class SessionBuilder {
     return this;
   }
 
-  compaction(summary: string, firstKeptEntryId: string): this {
+  contextEdit(targetId: string, replacement: { content: string | ContentBlock[] } | null): this {
     ts += 1000;
-    this.entries.push({ type: "compaction", id: `e${n++}`, parentId: this.last()?.id ?? null, timestamp: new Date(ts).toISOString(), summary, firstKeptEntryId, tokensBefore: 1 });
+    this.entries.push({ type: "context_edit", id: `e${n++}`, parentId: this.last()?.id ?? null, timestamp: new Date(ts).toISOString(), targetId, replacement });
+    return this;
+  }
+
+  /** What pi appends for a compaction draft. `null` keeps nothing before the entry (retain-none). */
+  compaction(summary: string, firstKeptEntryId: string | null, details?: unknown): this {
+    ts += 1000;
+    const id = `e${n++}`;
+    this.entries.push({ type: "compaction", id, parentId: this.last()?.id ?? null, timestamp: new Date(ts).toISOString(), summary, firstKeptEntryId: firstKeptEntryId ?? id, tokensBefore: 1, details });
     return this;
   }
 

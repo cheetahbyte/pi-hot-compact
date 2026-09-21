@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "bun:test";
+import { eventText, textOf } from "../src/content.ts";
 import { EventLog } from "../src/log.ts";
+import { recall } from "../src/recall.ts";
 import { resetFixtures, SessionBuilder } from "./fixtures.ts";
 
 test("seq is monotonic and stable across appends", () => {
@@ -38,4 +40,21 @@ test("compaction and custom_message entries become context messages; custom entr
   assert.equal(log.get(2)?.message?.role, "compactionSummary");
   assert.equal(log.get(2)?.message?.summary, "summary text");
   assert.equal(log.messageEvents().length, 2);
+});
+
+test("context_edit omits or replaces the model-visible message and keeps the raw one for recall", () => {
+  resetFixtures();
+  const b = new SessionBuilder().user("a").assistant("reply text", [{ name: "bash", args: { command: "ls" }, result: "big output" }]);
+  b.contextEdit("e2", { content: [{ type: "text", text: "collapsed" }] }).contextEdit("e1", null);
+  const log = new EventLog();
+  log.sync(b.entries);
+  assert.equal(log.get(1)?.message, undefined);
+  assert.equal(log.get(1)?.rawMessage?.role, "assistant");
+  assert.equal(textOf(log.get(2)?.message?.content), "collapsed");
+  assert.equal(textOf(log.get(2)?.rawMessage?.content), "big output");
+  assert.equal(eventText(log.get(2)!), "big output");
+  assert.equal(log.get(3)?.message, undefined);
+  assert.deepEqual(log.messageEvents().map((e) => e.seq), [0, 2]);
+  assert.deepEqual(recall(log, { mode: "keyword", query: "big output" }).hits.map((h) => h.seq), [2]);
+  assert.deepEqual(recall(log, { mode: "keyword", query: "reply" }).hits.map((h) => h.seq), [1]);
 });

@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "bun:test";
 import { HybridCompiler } from "../src/compilers/hybrid.ts";
 import { SEMANTIC_SECTIONS } from "../src/compilers/semantic.ts";
-import { HotCompactionManager, type PersistedGeneration } from "../src/hot-compaction.ts";
-import { alignMessages } from "../src/projection.ts";
-import type { SessionEvent } from "../src/types.ts";
-import { bigSession, resetFixtures } from "./fixtures.ts";
+import { compactionDetails, generationFromLog, HotCompactionManager } from "../src/hot-compaction.ts";
+import { EventLog } from "../src/log.ts";
+import type { CompiledContext, SessionEvent } from "../src/types.ts";
+import { bigSession, resetFixtures, type SessionBuilder } from "./fixtures.ts";
 
 const fakeCheckpoint = SEMANTIC_SECTIONS.map((s) => `[${s}]\n- item`).join("\n");
 
@@ -23,16 +23,21 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 
 function setup(opts: { complete?: (p: string, s?: AbortSignal) => Promise<string> } = {}) {
   resetFixtures();
-  const persisted: PersistedGeneration[] = [];
   let now = 1_000_000;
   const compiler = new HybridCompiler({ complete: opts.complete, maxCheckpointTokens: 4000, deterministic: { briefTokens: 800 } });
-  const manager = new HotCompactionManager(compiler, { tailTokens: 1500, cooldownMs: 0, minDeltaTokens: 0, jobTimeoutMs: 5000 }, { persist: (g) => persisted.push(g), now: () => now });
-  return { compiler, manager, persisted, advance: (ms: number) => (now += ms) };
+  const manager = new HotCompactionManager(compiler, { tailTokens: 1500, cooldownMs: 0, minDeltaTokens: 0, jobTimeoutMs: 5000 }, { now: () => now });
+  return { compiler, manager, advance: (ms: number) => (now += ms) };
 }
 
-test("hot compaction: snapshot, continue, reconcile delta exactly, atomic swap", async () => {
+/** What pi does with a compaction draft returned from a boundary handler. */
+function commit(session: SessionBuilder, manager: HotCompactionManager, compiled: CompiledContext, source: "hot" | "emergency" = "hot"): void {
+  session.compaction(compiled.checkpoint, compiled.firstKeptEntryId, compactionDetails(compiled, source));
+  manager.syncBranch(session.entries);
+}
+
+test("hot compaction: snapshot, continue, commit at the next boundary, delta kept verbatim", async () => {
   const gate = deferred<string>();
-  const { compiler, manager, persisted } = setup({ complete: () => gate.promise });
+  const { manager } = setup({ complete: () => gate.promise });
   const session = bigSession(10, 1200);
   manager.syncBranch(session.entries);
   assert.equal(manager.maybeStart({ percent: 75, tokens: 0, contextWindow: 1 }), null);
@@ -45,64 +50,81 @@ test("hot compaction: snapshot, continue, reconcile delta exactly, atomic swap",
   session.user("delta turn A").assistant("delta reply A", [{ name: "bash", args: { command: "ls" }, result: "a b c" }]);
   session.user("delta turn B");
   manager.syncBranch(session.entries);
-  assert.equal(manager.trySwap(), null, "not ready yet: nothing swapped");
-  assert.equal(manager.active, null);
+  assert.equal(manager.takeReady(), null, "not ready yet: nothing handed out");
+  assert.equal(manager.active?.id, undefined);
 
   gate.resolve(fakeCheckpoint);
   await tick();
   assert.equal(manager.currentJob?.status, "ready");
-  const gen = manager.trySwap()!;
-  assert.ok(gen);
-  assert.equal(gen.source, "hot");
-  assert.equal(gen.compiled.throughSeq, snapshotThrough);
-  assert.ok(gen.compiled.semantic?.includes("[Current Work]"));
-  assert.equal(persisted.length, 1);
-  assert.equal(persisted[0].throughEntryId, session.entries[snapshotThrough].id);
+  const ready = manager.takeReady()!;
+  assert.ok(ready);
+  assert.equal(ready.mode, "hot");
+  assert.equal(ready.compiled.throughSeq, snapshotThrough);
+  assert.ok(ready.compiled.firstKeptSeq <= snapshotThrough);
+  assert.ok(ready.compiled.semantic?.includes("[Current Work]"));
+  assert.ok(ready.compiled.checkpoint.includes("[Session Goal]"));
+  assert.equal(manager.currentJob, null);
+  assert.equal(manager.active?.id, undefined, "nothing is active until pi commits the entry");
 
-  // Model-visible context: checkpoint + every event from the boundary, including the delta, no loss, no duplicates.
-  const aligned = alignMessages(session.messages(), manager.log);
-  const ctx = compiler.reconcile(gen.compiled, aligned, undefined, gen.id);
-  const first = ctx.messages[0];
-  assert.equal(first.role, "custom");
-  assert.ok(String(first.content).includes("[Session Goal]"));
-  const seqs = aligned.filter((e) => e.seq >= gen.compiled.firstKeptSeq).map((e) => e.seq);
-  const expected = manager.log.messageEvents(gen.compiled.firstKeptSeq).map((e) => e.seq);
-  assert.deepEqual(seqs, expected);
-  assert.equal(ctx.messages.length, 1 + expected.length);
-  assert.equal(new Set(seqs).size, seqs.length);
-  const lastMsg = ctx.messages[ctx.messages.length - 1];
-  assert.equal(lastMsg.content, "delta turn B");
-  assert.ok(ctx.droppedEvents > 0);
+  commit(session, manager, ready.compiled);
+  const gen = manager.active!;
+  assert.equal(gen.source, "hot");
+  assert.equal(gen.id, session.entries.at(-1)!.id);
+  assert.equal(gen.compiled.firstKeptSeq, ready.compiled.firstKeptSeq);
+  assert.equal(gen.compiled.throughSeq, snapshotThrough);
+  assert.equal(gen.compiled.semantic, ready.compiled.semantic);
+  assert.equal(gen.compiled.checkpoint, ready.compiled.checkpoint);
+  // Every event from the kept boundary on, including the delta, is still in the log untouched.
+  const kept = manager.log.messageEvents(gen.compiled.firstKeptSeq);
+  assert.equal(kept.at(-2)?.message?.content, "delta turn B");
+  assert.equal(kept.at(-1)?.message?.role, "compactionSummary");
 });
 
-test("a stale job (base generation changed) is discarded, never applied", async () => {
+test("a job made stale by a compaction pi wrote meanwhile is discarded, never applied", async () => {
   const gate = deferred<string>();
   const { manager } = setup({ complete: () => gate.promise });
   const session = bigSession(10, 1200);
   manager.syncBranch(session.entries);
   manager.start("hot");
-  // Meanwhile pi ran a native compaction, which becomes the active generation.
   session.compaction("native summary", session.entries[4].id);
   manager.syncBranch(session.entries);
-  const native = manager.adoptNative({ id: session.entries.at(-1)!.id, summary: "native summary", firstKeptEntryId: session.entries[4].id });
-  assert.ok(native?.compiled.native);
-  assert.equal(manager.currentJob, null, "native compaction cancels the running job");
+  assert.equal(manager.active?.source, "foreign");
+  assert.equal(manager.active?.compiled.foreign, true);
+  assert.equal(manager.active?.compiled.checkpoint, "native summary");
+  assert.equal(manager.currentJob, null, "a new generation cancels the running job");
   gate.resolve(fakeCheckpoint);
   await tick();
-  assert.equal(manager.trySwap(), null);
-  assert.equal(manager.active?.id, native!.id);
+  assert.equal(manager.takeReady(), null);
+  assert.equal(manager.active?.id, session.entries.at(-1)!.id);
 });
 
-test("a branch change invalidates the generation and the job", async () => {
+test("a ready job whose base generation changed is stale", async () => {
+  const gate = deferred<string>();
+  const { manager } = setup({ complete: () => gate.promise });
+  const session = bigSession(10, 1200);
+  manager.syncBranch(session.entries);
+  manager.start("hot");
+  gate.resolve(fakeCheckpoint);
+  await tick();
+  assert.equal(manager.currentJob?.status, "ready");
+  session.compaction("native summary", session.entries[4].id);
+  manager.syncBranch(session.entries);
+  assert.equal(manager.takeReady(), null);
+  assert.equal(manager.history.at(-1)?.status, "stale");
+});
+
+test("a branch change invalidates the generation and the job", () => {
   const { manager } = setup();
   const session = bigSession(10, 1200);
   manager.syncBranch(session.entries);
-  manager.start("emergency");
-  await tick();
-  assert.ok(manager.trySwap());
+  const ready = manager.emergency()!;
+  commit(session, manager, ready.compiled, "emergency");
+  assert.equal(manager.active?.source, "emergency");
+  manager.start("hot");
   const forked = session.entries.slice(0, 5);
   manager.syncBranch(forked);
-  assert.equal(manager.active, null);
+  assert.equal(manager.active?.id, undefined);
+  assert.equal(manager.currentJob, null);
   assert.equal(manager.log.epoch, 1);
 });
 
@@ -121,11 +143,11 @@ test("compile failure is recorded, does not throw, and retries later", async () 
   await tick();
   assert.equal(manager.currentJob?.status, "failed");
   assert.equal(manager.currentJob?.error, "model down");
-  assert.equal(manager.trySwap(), null);
+  assert.equal(manager.takeReady(), null);
   advance(1);
   assert.equal(manager.maybeStart({ percent: 80, tokens: 0, contextWindow: 1 }), null);
   await tick();
-  assert.ok(manager.trySwap());
+  assert.ok(manager.takeReady());
   assert.equal(calls, 2);
 });
 
@@ -153,15 +175,17 @@ test("timeout aborts the semantic call and the agent continues", async () => {
   assert.match(manager.currentJob?.error ?? "", /timeout/);
 });
 
-test("emergency compiles deterministically and swaps immediately", () => {
+test("emergency compiles deterministically and hands the result out immediately", () => {
   const { manager } = setup();
   const session = bigSession(10, 1200);
   manager.syncBranch(session.entries);
-  const gen = manager.emergency();
-  assert.ok(gen);
-  assert.equal(gen.source, "emergency");
-  assert.equal(gen.compiled.semantic, undefined);
-  assert.equal(manager.active?.id, gen.id);
+  const ready = manager.emergency()!;
+  assert.ok(ready);
+  assert.equal(ready.mode, "emergency");
+  assert.equal(ready.compiled.semantic, undefined);
+  assert.equal(manager.active?.id, undefined);
+  commit(session, manager, ready.compiled, "emergency");
+  assert.equal(manager.active?.compiled.checkpoint, ready.compiled.checkpoint);
 });
 
 test("generations chain: the next job starts from the active generation and advances the boundary", async () => {
@@ -170,13 +194,16 @@ test("generations chain: the next job starts from the active generation and adva
   manager.syncBranch(session.entries);
   manager.start("hot");
   await tick();
-  const g1 = manager.trySwap()!;
+  commit(session, manager, manager.takeReady()!.compiled);
+  const g1 = manager.active!;
   for (let i = 0; i < 6; i++) session.user(`more ${i}`).assistant(`reply ${i}`, [{ name: "bash", args: { command: "x" }, result: "y".repeat(1200) }]);
   manager.syncBranch(session.entries);
   manager.start("hot");
+  assert.equal(manager.currentJob?.baseGeneration, g1.id);
   await tick();
-  const g2 = manager.trySwap()!;
-  assert.equal(g2.baseGenerationId, g1.id);
+  commit(session, manager, manager.takeReady()!.compiled);
+  const g2 = manager.active!;
+  assert.notEqual(g2.id, g1.id);
   assert.ok(g2.compiled.firstKeptSeq > g1.compiled.firstKeptSeq);
 });
 
@@ -187,22 +214,38 @@ test("nothing to compact when the session fits in the tail", async () => {
   await tick();
   assert.equal(manager.currentJob?.status, "failed");
   assert.match(manager.currentJob?.error ?? "", /tail/);
-  assert.equal(manager.trySwap(), null);
+  assert.equal(manager.takeReady(), null);
 });
 
-test("restore picks up a persisted generation whose boundaries are on the branch", async () => {
-  const { manager, persisted } = setup({ complete: async () => fakeCheckpoint });
+test("a fresh manager derives the generation from the branch (restart, resume, fork)", async () => {
+  const { manager } = setup({ complete: async () => fakeCheckpoint });
   const session = bigSession(10, 1200);
   manager.syncBranch(session.entries);
   manager.start("hot");
   await tick();
-  const gen = manager.trySwap()!;
+  commit(session, manager, manager.takeReady()!.compiled);
+  const gen = manager.active!;
   const fresh = new HotCompactionManager(new HybridCompiler(), { tailTokens: 1500 });
   fresh.syncBranch(session.entries);
-  const restored = fresh.restore(persisted)!;
-  assert.equal(restored.id, gen.id);
-  assert.equal(restored.compiled.firstKeptSeq, gen.compiled.firstKeptSeq);
-  assert.equal(restored.compiled.checkpoint, gen.compiled.checkpoint);
+  assert.equal(fresh.active?.id, gen.id);
+  assert.equal(fresh.active?.source, "hot");
+  assert.equal(fresh.active?.compiled.firstKeptSeq, gen.compiled.firstKeptSeq);
+  assert.equal(fresh.active?.compiled.throughSeq, gen.compiled.throughSeq);
+  assert.equal(fresh.active?.compiled.checkpoint, gen.compiled.checkpoint);
+  assert.equal(fresh.active?.compiled.semantic, gen.compiled.semantic);
+});
+
+test("a retain-none compaction keeps nothing before itself", () => {
+  resetFixtures();
+  const session = bigSession(3, 100);
+  session.compaction("all summarised", null);
+  const log = new EventLog();
+  log.sync(session.entries);
+  const gen = generationFromLog(log)!;
+  assert.ok(gen);
+  assert.equal(gen.source, "foreign");
+  assert.equal(gen.compiled.firstKeptSeq, log.lastSeq);
+  assert.equal(gen.compiled.throughSeq, log.lastSeq);
 });
 
 test("compileAt honours pi's boundary for native compaction", () => {

@@ -77,12 +77,12 @@ export function recall(log: EventLog, q: RecallQuery): RecallResult {
       const full = eventText(ev);
       const slice = full.slice(offset, offset + maxChars);
       const more = offset + maxChars < full.length ? `\n[… ${full.length - offset - maxChars} more chars; call again with offset=${offset + maxChars}]` : "";
-      const details = ev.message?.role === "toolResult" ? ` toolCallId=${ev.message.toolCallId}` : "";
+      const details = ev.rawMessage?.role === "toolResult" ? ` toolCallId=${ev.rawMessage.toolCallId}` : "";
       return { mode: q.mode, total: 1, hits: [hit(ev, clip(oneLine(full), 160))], text: `event://${ev.seq} [${roleLabel(ev)}] ${isoTime(ev.timestamp)}${details}\n${slice}${more}` };
     }
     case "range": {
-      total = scope.filter((e) => e.message).length;
-      const page = scope.filter((e) => e.message).slice(offset, offset + limit);
+      total = scope.filter((e) => e.rawMessage).length;
+      const page = scope.filter((e) => e.rawMessage).slice(offset, offset + limit);
       hits = page.map((ev) => hit(ev, clip(oneLine(eventText(ev)), 200)));
       break;
     }
@@ -95,7 +95,7 @@ export function recall(log: EventLog, q: RecallQuery): RecallResult {
       }
       const all: RecallHit[] = [];
       for (const ev of scope) {
-        if (!ev.message) continue;
+        if (!ev.rawMessage) continue;
         const text = eventText(ev);
         const m = re.exec(text);
         if (m) all.push(hit(ev, excerptAround(text, m.index)));
@@ -108,7 +108,7 @@ export function recall(log: EventLog, q: RecallQuery): RecallResult {
       const terms = (q.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
       const all: RecallHit[] = [];
       for (const ev of scope) {
-        if (!ev.message) continue;
+        if (!ev.rawMessage) continue;
         const text = eventText(ev);
         const i = terms.length ? matchesAll(text, terms) : 0;
         if (i >= 0) all.push(hit(ev, excerptAround(text, i)));
@@ -121,10 +121,10 @@ export function recall(log: EventLog, q: RecallQuery): RecallResult {
       const needle = (q.query ?? "").toLowerCase();
       const all: RecallHit[] = [];
       const results = new Map<string, SessionEvent>();
-      for (const ev of scope) if (ev.message?.role === "toolResult" && ev.message.toolCallId) results.set(ev.message.toolCallId, ev);
+      for (const ev of scope) if (ev.rawMessage?.role === "toolResult" && ev.rawMessage.toolCallId) results.set(ev.rawMessage.toolCallId, ev);
       for (const ev of scope) {
-        if (ev.message?.role !== "assistant") continue;
-        for (const tc of toolCallsOf(ev.message)) {
+        if (ev.rawMessage?.role !== "assistant") continue;
+        for (const tc of toolCallsOf(ev.rawMessage)) {
           let args = "";
           try {
             args = JSON.stringify(tc.arguments);
@@ -135,7 +135,7 @@ export function recall(log: EventLog, q: RecallQuery): RecallResult {
           if (needle && !hay.includes(needle)) continue;
           const r = results.get(tc.id);
           const rtext = r ? eventText(r) : "";
-          const summary = r ? `${r.message!.isError ? "error" : "ok"}, ${rtext.length} chars → event://${r.seq}: ${clip(oneLine(rtext), 120)}` : "no result";
+          const summary = r ? `${r.rawMessage!.isError ? "error" : "ok"}, ${rtext.length} chars → event://${r.seq}: ${clip(oneLine(rtext), 120)}` : "no result";
           all.push(hit(ev, `${tc.name}(${clip(args, 160)}) → ${summary}`));
         }
       }
@@ -147,10 +147,10 @@ export function recall(log: EventLog, q: RecallQuery): RecallResult {
       const needle = (q.query ?? "").toLowerCase();
       const all: RecallHit[] = [];
       for (const ev of scope) {
-        if (!ev.message) continue;
+        if (!ev.rawMessage) continue;
         let matched = false;
-        if (ev.message.role === "assistant") {
-          for (const tc of toolCallsOf(ev.message)) {
+        if (ev.rawMessage.role === "assistant") {
+          for (const tc of toolCallsOf(ev.rawMessage)) {
             let args = "";
             try {
               args = JSON.stringify(tc.arguments).toLowerCase();

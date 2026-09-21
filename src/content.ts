@@ -57,7 +57,7 @@ export function firstStringArg(args: Record<string, unknown>): string | undefine
 
 /** Full searchable text of an event, used by recall and the brief transcript. */
 export function eventText(ev: SessionEvent): string {
-  const m = ev.message;
+  const m = ev.rawMessage ?? ev.message;
   if (!m) {
     if (ev.type === "custom") return `[custom entry ${ev.entry.customType ?? ""}]`;
     return `[${ev.type}]`;
@@ -90,7 +90,7 @@ export function eventText(ev: SessionEvent): string {
 }
 
 export function roleLabel(ev: SessionEvent): string {
-  const m = ev.message;
+  const m = ev.rawMessage ?? ev.message;
   if (!m) return ev.type;
   if (m.role === "toolResult") return `tool:${m.toolName ?? "?"}`;
   if (m.role === "custom") return `custom:${m.customType ?? "?"}`;

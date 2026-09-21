@@ -44,17 +44,29 @@ export class EventLog {
   private append(entry: EntryLike): void {
     const seq = this.events.length;
     const ts = Date.parse(entry.timestamp);
+    const raw = entryMessage(entry);
     const ev: SessionEvent = {
       seq,
       id: entry.id,
       parentId: entry.parentId,
       timestamp: Number.isFinite(ts) ? ts : 0,
       type: entry.type,
-      message: entryMessage(entry),
+      message: raw,
+      rawMessage: raw,
       entry,
     };
     this.events.push(ev);
     this.seqById.set(entry.id, seq);
+    if (entry.type === "context_edit" && entry.targetId) this.applyEdit(entry.targetId, entry.replacement ?? null);
+  }
+
+  // Latest edit on the branch wins (entries arrive in branch order); the raw message stays for recall.
+  private applyEdit(targetId: string, replacement: EntryLike["replacement"]): void {
+    const seq = this.seqById.get(targetId);
+    if (seq === undefined) return;
+    const target = this.events[seq];
+    if (!target.rawMessage) return;
+    target.message = replacement ? { ...target.rawMessage, content: replacement.content } : undefined;
   }
 
   get(seq: number): SessionEvent | undefined {

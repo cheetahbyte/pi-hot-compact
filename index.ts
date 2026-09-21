@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentBeforeSettleEvent, BoundaryResult, ExtensionAPI, ExtensionContext, SessionBoundaryDraft, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -7,12 +7,11 @@ import { Type } from "typebox";
 import { HybridCompiler } from "./src/compilers/hybrid.ts";
 import type { CompleteFn } from "./src/compilers/semantic.ts";
 import { DEFAULT_SETTINGS, loadSettings, type HotCompactSettings } from "./src/config.ts";
-import { HotCompactionManager, type PersistedGeneration } from "./src/hot-compaction.ts";
-import { alignMessages } from "./src/projection.ts";
+import { compactionDetails, HotCompactionManager, type ReadyResult } from "./src/hot-compaction.ts";
+import { planCollapses } from "./src/projection.ts";
 import { recall, type RecallMode } from "./src/recall.ts";
-import type { CompiledContext, EntryLike, Msg } from "./src/types.ts";
+import type { EntryLike } from "./src/types.ts";
 
-const GENERATION_ENTRY = "hot-compact:generation";
 const STATUS_KEY = "hot-compact";
 // pi-footer "Pi Event Value" widget ids (https://github.com/wobondar/pi-footer#extension-integration)
 const FOOTER_EVENT = "pi-footer:update-widget";
@@ -29,7 +28,6 @@ export default function (pi: ExtensionAPI) {
   let settings: HotCompactSettings = { ...DEFAULT_SETTINGS };
   let compiler = new HybridCompiler();
   let manager = new HotCompactionManager(compiler);
-  let pendingNative: CompiledContext | null = null;
   let lastUi: ExtensionContext["ui"] | null = null;
 
   const log = (line: string) => {
@@ -48,7 +46,6 @@ export default function (pi: ExtensionAPI) {
     compiler = new HybridCompiler({
       deterministic: { briefTokens: settings.briefTranscriptTokens },
       maxCheckpointTokens: settings.maxCheckpointTokens,
-      reconcile: { collapseToolOutputChars: settings.collapseToolOutputChars, collapseKeepRecentTurns: settings.collapseKeepRecentTurns },
     });
     manager = new HotCompactionManager(
       compiler,
@@ -61,22 +58,15 @@ export default function (pi: ExtensionAPI) {
         jobTimeoutMs: settings.jobTimeoutMs,
         maxRetries: settings.maxRetries,
       },
-      {
-        log,
-        onChange: publish,
-        persist: (gen) => {
-          try {
-            pi.appendEntry(GENERATION_ENTRY, gen);
-          } catch (err) {
-            log(`persist failed: ${String(err)}`);
-          }
-        },
-      },
+      { log, onChange: publish },
     );
     manager.enabled = settings.enabled;
   };
 
+  const lastFooter = new Map<string, string | null>();
   const footer = (widgetId: string, value: string | null) => {
+    if (lastFooter.get(widgetId) === value) return;
+    lastFooter.set(widgetId, value);
     try {
       pi.events.emit(FOOTER_EVENT, { widgetId, value });
     } catch {
@@ -84,12 +74,19 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** Publish state to pi's status line (ctx.ui.setStatus) and to pi-footer event widgets. */
+  let lastStatus: string | undefined;
+  const setStatus = (value: string | undefined) => {
+    if (lastStatus === value) return;
+    lastStatus = value;
+    lastUi?.setStatus(STATUS_KEY, value);
+  };
+
+  /** Publish state to pi's status line (ctx.ui.setStatus) and to pi-footer event widgets. Idle publishes nothing. */
   const publish = () => {
     const gen = manager.active;
     const job = manager.currentJob;
     if (!settings.enabled) {
-      lastUi?.setStatus(STATUS_KEY, undefined);
+      setStatus(undefined);
       footer(FOOTER_WIDGETS.state, "◌ Off");
       footer(FOOTER_WIDGETS.generation, null);
       footer(FOOTER_WIDGETS.job, null);
@@ -97,17 +94,28 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const jobText = job?.status === "running" ? "compacting…" : job?.status === "ready" ? "ready" : job?.status === "failed" && !job.noop ? "failed" : "";
+    if (!gen && !jobText) {
+      setStatus(undefined);
+      footer(FOOTER_WIDGETS.state, null);
+      footer(FOOTER_WIDGETS.generation, null);
+      footer(FOOTER_WIDGETS.job, null);
+      footer(FOOTER_WIDGETS.checkpoint, null);
+      return;
+    }
     const genText = gen ? `#${gen.compiled.firstKeptSeq}+` : "raw";
     const state = `● ${genText}${jobText ? ` ${jobText}` : ""}`;
-    lastUi?.setStatus(STATUS_KEY, state);
+    setStatus(state);
     footer(FOOTER_WIDGETS.state, state);
-    footer(FOOTER_WIDGETS.generation, gen ? `${gen.source} ${genText}` : "raw");
+    footer(FOOTER_WIDGETS.generation, gen ? `${gen.source} ${genText}` : null);
     footer(FOOTER_WIDGETS.job, jobText || null);
     footer(FOOTER_WIDGETS.checkpoint, gen ? `${Math.round(gen.compiled.estimatedTokens / 100) / 10}k` : null);
   };
 
   const status = (ctx: ExtensionContext) => {
-    if (ctx.hasUI) lastUi = ctx.ui;
+    if (ctx.hasUI && lastUi !== ctx.ui) {
+      lastUi = ctx.ui;
+      lastStatus = undefined;
+    }
     publish();
   };
 
@@ -146,63 +154,61 @@ export default function (pi: ExtensionAPI) {
     if (!reason) log(`job started at ${usage.percent?.toFixed(1)}%`);
   };
 
-  const restore = (ctx: ExtensionContext) => {
-    const entries = branch(ctx);
-    manager.syncBranch(entries);
-    const persisted: PersistedGeneration[] = [];
-    let lastGenSeq = -1;
-    let lastCompaction: { seq: number; entry: EntryLike } | null = null;
-    entries.forEach((e, i) => {
-      if (e.type === "custom" && e.customType === GENERATION_ENTRY && e.data) {
-        persisted.push(e.data as PersistedGeneration);
-        lastGenSeq = i;
+  const compactionDraft = (ready: ReadyResult): SessionBoundaryDraft => ({
+    type: "compaction",
+    summary: ready.compiled.checkpoint,
+    firstKeptEntryId: ready.compiled.firstKeptEntryId,
+    details: compactionDetails(ready.compiled, ready.mode),
+  });
+
+  /** Safe boundary between model calls: commit a ready generation, collapse old tool outputs, start the next job. */
+  const boundary = (event: TurnEndEvent | AgentBeforeSettleEvent, ctx: ExtensionContext): BoundaryResult | undefined => {
+    if (!settings.enabled) return undefined;
+    try {
+      manager.syncBranch(branch(ctx));
+      const drafts: SessionBoundaryDraft[] = [];
+      const usage = ctx.getContextUsage();
+      const otherCompaction = event.entries.some((e) => e.type === "compaction");
+      let ready: ReadyResult | null = null;
+      if (!otherCompaction) {
+        ready = manager.takeReady();
+        if (!ready && usage?.percent != null && usage.percent >= settings.hardPercent) {
+          ready = manager.emergency();
+          if (ready) log(`emergency generation at ${usage.percent.toFixed(1)}%`);
+        }
       }
-      if (e.type === "compaction") lastCompaction = { seq: i, entry: e };
-    });
-    const restored = manager.restore(persisted);
-    const lc = lastCompaction as { seq: number; entry: EntryLike } | null;
-    if (lc && (!restored || lc.seq > lastGenSeq)) {
-      manager.adoptNative({ id: lc.entry.id, summary: lc.entry.summary ?? "", firstKeptEntryId: lc.entry.firstKeptEntryId ?? "" });
+      if (ready) drafts.push(compactionDraft(ready));
+      else if (!otherCompaction) maybeStart(ctx);
+      const firstKeptSeq = ready ? ready.compiled.firstKeptSeq : (manager.active?.compiled.firstKeptSeq ?? 0);
+      const collapses = planCollapses(manager.log, firstKeptSeq, {
+        collapseToolOutputChars: settings.collapseToolOutputChars,
+        collapseKeepRecentTurns: settings.collapseKeepRecentTurns,
+      });
+      for (const c of collapses) drafts.push({ type: "context_edit", targetId: c.targetId, replacement: { content: [{ type: "text", text: c.text }] } });
+      if (drafts.length) log(`${event.type}: ${ready ? `compaction kept from #${ready.compiled.firstKeptSeq}` : "no compaction"}, ${collapses.length} collapsed`);
+      status(ctx);
+      return drafts.length ? { entries: [...event.entries, ...drafts] } : undefined;
+    } catch (err) {
+      log(`${event.type} handler error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      return undefined;
     }
   };
 
   pi.on("session_start", async (_event, ctx) => {
     setup(ctx.cwd);
-    restore(ctx);
+    manager.syncBranch(branch(ctx));
     log(`session start: ${manager.status()}`);
     status(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    restore(ctx);
+    manager.syncBranch(branch(ctx));
     status(ctx);
   });
 
-  pi.on("context", async (event, ctx) => {
-    if (!settings.enabled) return;
-    try {
-      manager.syncBranch(branch(ctx));
-      const usage = ctx.getContextUsage();
-      let gen = manager.trySwap();
-      if (!gen && usage?.percent != null && usage.percent >= settings.hardPercent) {
-        gen = manager.emergency();
-        if (gen) log(`emergency generation ${gen.id} at ${usage.percent.toFixed(1)}%`);
-      }
-      if (!gen) {
-        maybeStart(ctx);
-        gen = manager.active;
-      }
-      status(ctx);
-      if (!gen) return;
-      const aligned = alignMessages(event.messages as unknown as Msg[], manager.log);
-      const out = compiler.reconcile(gen.compiled, aligned, undefined, gen.id);
-      log(`context: gen ${gen.id}, ${out.messages.length} msgs, dropped ${out.droppedEvents}, collapsed ${out.collapsedToolOutputs}`);
-      return { messages: out.messages as unknown as typeof event.messages };
-    } catch (err) {
-      log(`context handler error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
-      return;
-    }
-  });
+  pi.on("turn_end", async (event, ctx) => boundary(event, ctx));
+
+  pi.on("agent_before_settle", async (event, ctx) => boundary(event, ctx));
 
   pi.on("agent_end", async (_event, ctx) => {
     if (!settings.enabled) return;
@@ -211,40 +217,33 @@ export default function (pi: ExtensionAPI) {
     status(ctx);
   });
 
-  pi.on("session_before_compact", async (event, ctx) => {
-    pendingNative = null;
+  pi.on("session_before_compact", async (event) => {
     if (!settings.enabled || !settings.handleNativeCompaction) return;
     try {
       manager.syncBranch(event.branchEntries as unknown as EntryLike[]);
       const compiled = manager.compileAt(event.preparation.firstKeptEntryId);
       if (!compiled) return;
-      pendingNative = compiled;
       log(`native compaction (${event.reason}) served deterministically, kept from #${compiled.firstKeptSeq}`);
       return {
         compaction: {
           summary: compiled.checkpoint,
           firstKeptEntryId: compiled.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore,
-          details: { hotCompact: true, sections: compiled.sections, semantic: compiled.semantic },
+          details: compactionDetails(compiled, "native"),
         },
       };
     } catch (err) {
       log(`session_before_compact error: ${String(err)}`);
-      void ctx;
       return;
     }
   });
 
-  pi.on("session_compact", async (event, ctx) => {
+  pi.on("session_compact", async (_event, ctx) => {
     manager.syncBranch(branch(ctx));
-    const entry = event.compactionEntry;
-    manager.adoptNative({ id: entry.id, summary: entry.summary, firstKeptEntryId: entry.firstKeptEntryId }, pendingNative ?? undefined);
-    pendingNative = null;
     status(ctx);
   });
 
   pi.on("session_compact_failed", async (event) => {
-    pendingNative = null;
     log(`native compaction failed: ${event.errorMessage ?? (event.aborted ? "aborted" : "unknown")}`);
   });
 
@@ -296,14 +295,14 @@ export default function (pi: ExtensionAPI) {
           compiler.setComplete(makeComplete(ctx));
           manager.clearFailures();
           const job = manager.start("hot");
-          ctx.ui.notify(job ? `hot-compact: job ${job.id} started (through #${job.snapshotThroughSeq}); swaps in before the next model call once ready` : "hot-compact: nothing to compact", "info");
+          ctx.ui.notify(job ? `hot-compact: job ${job.id} started (through #${job.snapshotThroughSeq}); committed at the next turn boundary once ready` : "hot-compact: nothing to compact", "info");
           break;
         }
-        case "emergency": {
-          const gen = manager.emergency();
-          ctx.ui.notify(gen ? `hot-compact: deterministic generation ${gen.id} active (kept from #${gen.compiled.firstKeptSeq})` : "hot-compact: nothing to compact", gen ? "info" : "warning");
+        case "emergency":
+          // pi's compaction path calls session_before_compact, which the deterministic compiler serves.
+          ctx.compact();
+          ctx.ui.notify("hot-compact: deterministic compaction requested through pi", "info");
           break;
-        }
         case "retry":
           manager.clearFailures();
           ctx.ui.notify("hot-compact: failure counter reset", "info");
@@ -316,7 +315,7 @@ export default function (pi: ExtensionAPI) {
         case "off":
           settings.enabled = false;
           manager.enabled = false;
-          ctx.ui.notify("hot-compact: disabled (raw context until re-enabled)", "info");
+          ctx.ui.notify("hot-compact: disabled (no new compactions or collapses until re-enabled)", "info");
           break;
         default: {
           const usage = ctx.getContextUsage();

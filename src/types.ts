@@ -68,6 +68,9 @@ export interface EntryLike {
   tokensBefore?: number;
   fromId?: string;
   data?: unknown;
+  // context_edit
+  targetId?: string;
+  replacement?: { content: string | ContentBlock[] } | null;
   [key: string]: unknown;
 }
 
@@ -78,8 +81,10 @@ export interface SessionEvent {
   parentId: string | null;
   timestamp: number;
   type: string;
-  /** Context-visible message, when the entry carries one. */
+  /** Model-visible message after context edits; undefined when the entry carries none or was omitted. */
   message?: Msg;
+  /** Message as stored in the entry, before context edits. Recall reads this. */
+  rawMessage?: Msg;
   entry: EntryLike;
 }
 
@@ -108,7 +113,7 @@ export interface ContextSnapshot {
 }
 
 export interface CompiledContext {
-  /** Text injected in place of the compacted prefix. */
+  /** Text stored as the compaction summary in place of the compacted prefix. */
   checkpoint: string;
   /** First event kept verbatim. Everything before it is represented by the checkpoint. */
   firstKeptSeq: number;
@@ -119,17 +124,31 @@ export interface CompiledContext {
   semantic?: string;
   estimatedTokens: number;
   compiler: string;
-  /** True when pi already injects this checkpoint as a compaction summary. */
-  native?: boolean;
+  /** True when the summary was not written by this extension (pi's own or another extension's compaction). */
+  foreign?: boolean;
 }
 
+export type GenerationSource = "hot" | "emergency" | "native" | "foreign";
+
+/** The active generation: whatever the latest compaction entry on the branch says. */
 export interface ContextGeneration {
+  /** Id of the compaction entry that carries this generation. */
   id: string;
   epoch: number;
-  baseGenerationId: string | null;
   compiled: CompiledContext;
   createdAt: number;
-  source: "hot" | "emergency" | "native" | "restored";
+  source: GenerationSource;
+}
+
+/** Stored in CompactionEntry.details by this extension. */
+export interface HotCompactDetails {
+  hotCompact: true;
+  source: "hot" | "emergency" | "native";
+  compiler: string;
+  sections: DeterministicSections;
+  semantic?: string;
+  /** Last event in the compile snapshot, so the next semantic span starts after it. */
+  throughEntryId: string;
 }
 
 export type JobStatus = "running" | "ready" | "stale" | "failed" | "applied";
@@ -150,14 +169,6 @@ export interface CompactionJob {
   compiled?: CompiledContext;
 }
 
-/** Model-visible context after reconciliation. */
-export interface Context {
-  messages: Msg[];
-  generationId: string | null;
-  droppedEvents: number;
-  collapsedToolOutputs: number;
-}
-
 export interface SnapshotInput {
   events: SessionEvent[];
   epoch: number;
@@ -173,11 +184,18 @@ export interface CompileOptions {
   firstKeptSeq?: number;
 }
 
-export interface ReconcileOptions {
+export interface CollapseOptions {
   /** Collapse tool outputs longer than this many chars (0 disables). */
   collapseToolOutputChars: number;
   /** Tool outputs inside the most recent N user turns are never collapsed. */
   collapseKeepRecentTurns: number;
+}
+
+/** A tool result to replace through a context_edit entry. */
+export interface CollapsePlan {
+  seq: number;
+  targetId: string;
+  text: string;
 }
 
 export interface ContextCompiler {
@@ -186,7 +204,6 @@ export interface ContextCompiler {
   compile(snapshot: ContextSnapshot, options?: CompileOptions): Promise<CompiledContext>;
   /** Synchronous, deterministic-only compile for emergency and native-compaction paths. */
   compileSync(snapshot: ContextSnapshot, options?: CompileOptions): CompiledContext;
-  reconcile(compiled: CompiledContext, delta: SessionEvent[], options?: Partial<ReconcileOptions>, generationId?: string): Context;
 }
 
 export class NothingToCompactError extends Error {
